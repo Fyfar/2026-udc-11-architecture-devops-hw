@@ -1,0 +1,200 @@
+# Поштомат громади: тести → збірка образу → деплой на VM з ручним погодженням.
+#
+# Щоб GitHub його запускав, файл має лежати в .github/workflows/deploy.yml.
+#
+# Налаштування репозиторію (Settings → Environments → production):
+#   - Required reviewers: хто погоджує деплой; Deployment branches: лише main.
+#   - Environment secrets (недоступні job до погодження):
+#       DEPLOY_HOST          адреса VM
+#       DEPLOY_USER          користувач на VM із доступом до docker
+#       DEPLOY_SSH_KEY       приватний ключ (окремий, лише для деплою)
+#       DEPLOY_KNOWN_HOSTS   рядок(и) known_hosts для VM: `ssh-keyscan -t ed25519 <host>`,
+#                            звірений з відбитком на самій VM
+#       DATABASE_URL         рядок підключення до PostgreSQL
+#       SMS_TOKEN            токен SMS-провайдера
+#
+# Екшени сторонніх авторів не використовуються; actions/checkout варто закріпити за
+# commit SHA (Dependabot для github-actions оновлюватиме його).
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Усе заборонено за замовчуванням; кожен job просить лише своє.
+permissions: {}
+
+# Два деплої одночасно на одну VM не йдуть; той, що в черзі, не скасовує поточний.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    container: node:22-bookworm-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Unit tests
+        working-directory: app
+        run: npm test
+
+  compose-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate compose.yaml
+        working-directory: deploy
+        run: |
+          touch secrets.env
+          POSHTOMAT_IMAGE=example.invalid/poshtomat:check docker compose -f compose.yaml config --quiet
+
+  build:
+    needs: [test, compose-check]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write          # push у GHCR через GITHUB_TOKEN, без довгоживучих токенів
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and push
+        id: push
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/poshtomat"
+          docker build --pull \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -f deploy/Dockerfile -t "${repo}:${GITHUB_SHA}" app
+          docker push "${repo}:${GITHUB_SHA}"
+          # Деплоїмо за digest, а не за тегом: на VM потрапить саме те, що зібрано тут.
+          image="$(docker inspect --format '{{index .RepoDigests 0}}' "${repo}:${GITHUB_SHA}")"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "Image: \`${image}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Job чекає погодження reviewers з налаштувань environment.
+    environment:
+      name: production
+    permissions:
+      contents: read
+      packages: read           # VM тягне образ одноразовим GITHUB_TOKEN цього job
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      APP_DIR: /opt/poshtomat
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          install -d -m 700 ~/.ssh
+          install -m 600 /dev/null ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host vm
+            HostName ${DEPLOY_HOST}
+            User ${DEPLOY_USER}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            BatchMode yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Upload compose.yaml and secrets
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SMS_TOKEN: ${{ secrets.SMS_TOKEN }}
+        run: |
+          for v in DATABASE_URL SMS_TOKEN; do
+            if [ -z "${!v}" ] || [[ "${!v}" == *$'\n'* ]]; then echo "::error::secret $v is empty or multiline"; exit 1; fi
+          done
+          ssh vm "mkdir -p '$APP_DIR'"
+          scp -q deploy/compose.yaml "vm:$APP_DIR/compose.yaml.new"
+          # Секрети йдуть через stdin, а не аргументами: не потрапляють у ps і логи.
+          printf 'DATABASE_URL=%s\nSMS_TOKEN=%s\n' "$DATABASE_URL" "$SMS_TOKEN" \
+            | ssh vm "umask 077 && cat > '$APP_DIR/secrets.env.new'"
+
+      - name: Log in to GHCR on VM
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | ssh vm "docker login ghcr.io -u '$GITHUB_ACTOR' --password-stdin"
+
+      - name: Roll out (rolls back on failed healthcheck)
+        run: |
+          ssh vm bash -s -- "$APP_DIR" "$IMAGE" <<'REMOTE'
+          set -euo pipefail
+          dir="$1"; image="$2"
+          cd "$dir"
+
+          # Зберігаємо попередній стан для відкату.
+          for f in compose.yaml secrets.env .env; do
+            if [ -f "$f" ]; then cp -p "$f" "$f.prev"; fi
+          done
+
+          mv compose.yaml.new compose.yaml
+          mv secrets.env.new secrets.env
+          umask 077; printf 'POSHTOMAT_IMAGE=%s\n' "$image" > .env
+
+          docker compose pull api worker
+          if docker compose up -d --remove-orphans --wait --wait-timeout 90; then
+            echo "Deployed $image"
+            exit 0
+          fi
+
+          echo "::error::new release is unhealthy, rolling back"
+          docker compose logs --tail 50 api worker || true
+          if [ -f .env.prev ]; then
+            for f in compose.yaml secrets.env .env; do
+              if [ -f "$f.prev" ]; then mv "$f.prev" "$f"; fi
+            done
+            docker compose up -d --remove-orphans --wait --wait-timeout 90
+            echo "Rolled back to $(cat .env)"
+          fi
+          exit 1
+          REMOTE
+
+      - name: Clean up
+        if: always()
+        run: |
+          ssh vm "docker logout ghcr.io; rm -f '$APP_DIR/compose.yaml.new' '$APP_DIR/secrets.env.new'" || true
+          rm -f ~/.ssh/deploy_key

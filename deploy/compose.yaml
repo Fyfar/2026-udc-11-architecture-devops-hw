@@ -1,35 +1,71 @@
-# Поштомат громади — продакшн на одній VM (docker compose up -d).
-# PostgreSQL працює на самій VM, поза compose.
+# Поштомат громади — продакшн на одній VM. PostgreSQL працює на самій VM, поза compose.
+#
+# Файли в каталозі проєкту на VM (/opt/poshtomat), їх кладе pipeline/deploy.yml:
+#   compose.yaml  — цей файл
+#   .env          — POSHTOMAT_IMAGE=ghcr.io/<owner>/poshtomat@sha256:...  (не секрет)
+#   secrets.env   — DATABASE_URL, SMS_TOKEN; права 0600, береться з GitHub secrets
+#
+# Образ не збирається на VM: його збирає CI, тут він лише підтягується за digest.
+
+x-app: &app
+  image: ${POSHTOMAT_IMAGE:?POSHTOMAT_IMAGE must be set in .env}
+  init: true                     # коректна передача сигналів і збирання зомбі-процесів
+  restart: unless-stopped
+  env_file:
+    - path: ./secrets.env
+      required: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 128
+  stop_grace_period: 20s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+x-env: &env
+  TZ: "Europe/Kyiv"
+  LOG_LEVEL: "info"
+  DB_POOL_MAX: "20"
+  DB_POOL_WAIT_MS: "2000"
+  SMS_BASE_URL: "https://sms.example.net/api/v2"
+  SMS_RATE_PER_SEC: "20"
+  COURIER_BASE_URL: "https://courier.example.com/api/v1"
+  # DATABASE_URL і SMS_TOKEN — лише з secrets.env, тут їх навмисно немає
+
 services:
   api:
-    image: poshtomat:latest
-    build:
-      context: ../app
-      dockerfile: ../deploy/Dockerfile
+    <<: *app
+    environment:
+      <<: *env
+      PORT: "8080"
     ports:
       - "8080:8080"
-    environment:
-      TZ: "Europe/Kyiv"
-      PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    mem_limit: 512m
+    cpus: 1.0
 
   worker:
-    image: poshtomat:latest
+    <<: *app
     command: ["node", "src/worker.js"]
-    environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    environment: *env
+    healthcheck:
+      disable: true              # порт не слухає; healthcheck з образу тут завжди падав би
+    mem_limit: 256m
+    cpus: 0.5
+
+  # Нічна задача. Не стартує з `up`; cron на VM:
+  #   15 3 * * *  cd /opt/poshtomat && docker compose run --rm expire
+  expire:
+    <<: *app
+    profiles: ["jobs"]
+    command: ["node", "bin/expire-parcels.js"]
+    restart: "no"
+    environment: *env
+    healthcheck:
+      disable: true
+    mem_limit: 256m
