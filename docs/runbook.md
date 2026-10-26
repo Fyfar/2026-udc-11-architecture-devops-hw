@@ -25,14 +25,37 @@ _Власник: керівник on-call ротації. Складено 2026-
   конфігу, відкат потрібно почати в перші 10 хв після пейджа, не чекаючи, поки знайдеться
   причина.
 
-**Як влаштований прод** (`deploy/compose.yaml`, шапка `incident/deploys.log`, `docs/ops/backup-runbook.md`):
+**Як влаштований прод** (`deploy/compose.yaml`, `pipeline/deploy.yml`, `docs/ops/backup-runbook.md`):
 одна VM `poshtomat-prod-1`, на ній docker compose з двома сервісами, `api` (порт `8080`) і
-`worker` (SMS). PostgreSQL працює на тій самій VM, поза compose. Кожен процес має власний
-пул з'єднань до БД. Його розмір задає `DB_POOL_MAX`, а час очікування вільного з'єднання —
-`DB_POOL_WAIT_MS` (`app/src/config.js:9-10`). Якщо запит не дочекався з'єднання, API
-відповідає `503 {"error":"service busy, try again"}` і пише в лог
+`worker` (SMS), плюс нічна задача `expire`. PostgreSQL працює на тій самій VM, поза compose.
+Кожен процес має власний пул з'єднань до БД. Його розмір задає `DB_POOL_MAX`, а час
+очікування вільного з'єднання — `DB_POOL_WAIT_MS` (`app/src/config.js:9-10`). Якщо запит не
+дочекався з'єднання, API відповідає `503 {"error":"service busy, try again"}` і пише в лог
 `"error":"db pool wait timeout after 2000ms"` (`app/src/db.js:6`, `app/src/server.js:65`).
 Будь-яка інша неперехоплена помилка дає `500 {"error":"internal error"}`.
+
+**Як деплоїться** (`pipeline/deploy.yml`, `deploy/compose.yaml:1-8`). Образ збирає CI і пушить у
+GHCR; на VM нічого не збирається, git-checkout там немає. Усе лежить у каталозі `/opt/poshtomat`,
+файли належать користувачу деплою:
+
+- `compose.yaml` — копія `deploy/compose.yaml` з репо на момент деплою;
+- `.env` — `POSHTOMAT_IMAGE=<образ@sha256:…>` і `POSHTOMAT_SHA=<коротке sha релізу>`, без секретів;
+- `secrets.env` (права 0600) — `DATABASE_URL` і `SMS_TOKEN`;
+- `compose.yaml.prev`, `.env.prev`, `secrets.env.prev` (`secrets.env.prev` теж 0600) — стан до
+  останнього деплою, який **щось змінив**: образ, `compose.yaml` або секрети. Це **лише один крок назад**. Деплой
+  без жодних змін `*.prev` не чіпає. Перший деплой за новою схемою `*.prev` не створює
+  (поточних файлів ще немає), тож вони з'являються з другого деплою, що щось змінив;
+- `deploys.log` — журнал, який пише пайплайн:
+  - `<час> deploy <sha> <хто> <образ>` — реліз піднявся;
+  - `<час> failed <sha> <хто> <образ>` — реліз `unhealthy`; пишеться одразу, ще до спроби автовідкату;
+  - `<час> rollback <sha, на яке відкотилися, або unknown> <хто> failed <sha>` — автовідкат
+    піднявся. Якщо `failed` стоїть останнім без `rollback` після нього, автовідкат не піднявся.
+
+Пайплайн сам відкочує реліз, лише якщо після `docker compose up --wait` сервіс `unhealthy`: він
+копіює `*.prev` назад, тож після автовідкату `*.prev` лишаються і дорівнюють поточним файлам.
+Healthcheck ходить у `/health` (`deploy/Dockerfile:24-25`), а той завжди відповідає 200
+(`app/src/server.js:37`). Тому інцидент класу 14.10 автовідкат **не** зловить: відкат — ручний,
+за цим runbook.
 
 **Як читати логи.** Логи — це JSON lines з полями `ts`, `level`, `msg`. API пише **кожну**
 відповідь 5xx як `"msg":"request failed"` з полями `method`, `path`, `status`, `ms` і `error`.
@@ -46,12 +69,13 @@ markdown-таблиці вони копіюються з поламаними `\
 
 ## Перші 5 хвилин
 
-0. **Зайти на VM і перейти в каталог з `deploy/compose.yaml`.**
+0. **Зайдіть на VM і перейдіть у каталог деплою `/opt/poshtomat`.** Усі команди `docker compose …`
+   нижче запускаються звідси.
 
    ```bash
    ssh poshtomat-prod-1
-   cd /opt/poshtomat/repo         # git-checkout репо; скрипти бекапу лежать поруч, у /opt/poshtomat/ (docs/ops/backup-runbook.md)
-   ls deploy/compose.yaml         # так: файл є → далі; ні: не той каталог
+   cd /opt/poshtomat              # каталог деплою, без git-checkout; скрипти бекапу лежать тут же (docs/ops/backup-runbook.md)
+   ls compose.yaml .env secrets.env   # так: усі три є → далі; ні: прод ще на старій схемі (/opt/poshtomat/repo, docker compose -f deploy/compose.yaml), див. «Запасний варіант» у блоці «Відкат»
    ```
 
 1. **Напишіть у `#poshtomat-oncall`, що взяли пейдж.** Наприклад: «взяв(ла) ApiLatencyP95High/Api5xxRateHigh, дивлюсь».
@@ -59,13 +83,13 @@ markdown-таблиці вони копіюються з поламаними `\
 2. **Чи живі контейнери і яка версія відповідає?**
 
    ```bash
-   docker compose -f deploy/compose.yaml ps
+   docker compose ps
    curl -s -m 5 http://localhost:8080/health; echo
    ```
 
    - `ps`: у `api` і `worker` STATUS має бути `Up …`. Якщо там `Restarting`, `Exited` або
      сервісу немає в списку, проблема інша: контейнер не працює. Тоді дивіться
-     `docker compose -f deploy/compose.yaml logs --tail 50 api` і переходьте до кроку 3 (відкат).
+     `docker compose logs --tail 50 api` і переходьте до кроку 3 (відкат).
      Колонка CREATED показує, коли контейнер перестворили. «Кілька хвилин тому» майже
      напевно означає деплой або ручну дію.
    - `/health` відповідає `{"status":"ok","version":"X.Y.Z"}`. **Відповідь `200` не означає,
@@ -76,15 +100,16 @@ markdown-таблиці вони копіюються з поламаними `\
 
    ```bash
    # Д1: старти і зупинки процесів у логах за останні 2 год
-   docker compose -f deploy/compose.yaml logs --no-log-prefix --since 2h api worker | grep -e '"service started"' -e '"worker started"' -e '"shutting down"'
-   # журнал деплоїв на VM (формат як incident/deploys.log)
+   docker compose logs --no-log-prefix --since 2h api worker | grep -e '"service started"' -e '"worker started"' -e '"shutting down"'
+   # журнал деплоїв, який пише пайплайн (формат — «Як деплоїться»)
    tail -n 5 /opt/poshtomat/deploys.log
-   # коли востаннє змінювали compose-файл
-   ls -l deploy/compose.yaml
+   # коли востаннє змінювали compose-файл і образ
+   ls -l compose.yaml .env
    ```
 
-   - **Так:** є `service started` з новою версією, запис `deploy` у журналі або свіжий час
-     зміни `compose.yaml`, і пейдж прийшов після цього. Тоді переходьте до «Що робити»,
+   - **Так:** є `service started` з новою версією, запис `deploy` або `failed` у журналі
+     (`failed` теж означає свіжий деплой, навіть якщо за ним є `rollback`) або свіжий час
+     зміни `compose.yaml` чи `.env`, і пейдж прийшов після цього. Тоді переходьте до «Що робити»,
      рядок 1 (відкат), паралельно з кроком 4. 14.10 деплой був за 4 хв до пейджа, а відкат
      зробили лише через 45 хв.
    - **Ні:** за годину рестартів не було. Тоді причина, найімовірніше, не в релізі.
@@ -110,19 +135,21 @@ markdown-таблиці вони копіюються з поламаними `\
 
    ```bash
    # Д2: що бачить код (той самий loadConfig, що й сервіс; WORKDIR контейнера — /app)
-   docker compose -f deploy/compose.yaml exec -T api node -e 'import("./src/config.js").then((m) => { const c = m.loadConfig(); console.log("dbPoolMax=" + c.dbPoolMax, "dbPoolWaitMs=" + c.dbPoolWaitMs); })'
-   # оточення самого процесу (PID 1 — node, CMD у deploy/Dockerfile)
-   docker compose -f deploy/compose.yaml exec -T api sh -c 'tr "\0" "\n" < /proc/1/environ | grep "^DB_POOL"'
+   docker compose exec -T api node -e 'import("./src/config.js").then((m) => { const c = m.loadConfig(); console.log("dbPoolMax=" + c.dbPoolMax, "dbPoolWaitMs=" + c.dbPoolWaitMs); })'
+   # оточення, з яким стартував процес (PID 1 — docker-init через init: true, deploy/compose.yaml:12; він запускає node з тим самим оточенням)
+   docker compose exec -T api sh -c 'tr "\0" "\n" < /proc/1/environ | grep "^DB_POOL"'
    ```
 
    - **Норма:** `dbPoolMax=20 dbPoolWaitMs=2000` і змінні `DB_POOL_MAX=20` та
-     `DB_POOL_WAIT_MS=2000`. Такі значення стоять у `deploy/compose.yaml:16-17` (v1.7.3).
+     `DB_POOL_WAIT_MS=2000`. Такі значення стоять у `deploy/compose.yaml:34-35` (спільний блок
+     `x-env` для api, worker і expire), а у v1.7.3 — у `main:deploy/compose.yaml:16-17`.
    - **Проблема:** `dbPoolMax=4` означає, що змінна `DB_POOL_MAX` не задана або порожня, і
      код тихо взяв дефолт для локальної розробки (`app/src/config.js:8-9`). Шукайте в
      оточенні змінну зі схожою назвою: 14.10 це був `DB_POOL_SIZE=20`, якого код не читає.
      Рішення — «Що робити», рядок 1 або 2.
-   - Ці команди не друкують `SMS_TOKEN`. Не запускайте замість них `printenv` чи
-     `docker compose config` без `grep`.
+   - Ці команди не друкують `SMS_TOKEN` і `DATABASE_URL`. Не запускайте замість них `printenv` чи
+     `docker compose config` без `grep`: `config` підставляє і `secrets.env`, тож надрукує
+     обидва секрети.
 
    Приклад на даних інциденту: справжній `loadConfig` з оточенням v1.8.0 (`DB_POOL_SIZE`,
    див. `incident/changes/v1.8.0.diff:86-87`) і v1.7.3 (`DB_POOL_MAX`):
@@ -138,8 +165,8 @@ markdown-таблиці вони копіюються з поламаними `\
 5. **Зніміть логи за останню годину у файли.** Усі команди «Діагностики» працюють з ними.
 
    ```bash
-   docker compose -f deploy/compose.yaml logs --no-log-prefix --since 1h api > /tmp/api-1h.jsonl
-   docker compose -f deploy/compose.yaml logs --no-log-prefix --since 1h worker > /tmp/worker-1h.jsonl
+   docker compose logs --no-log-prefix --since 1h api > /tmp/api-1h.jsonl
+   docker compose logs --no-log-prefix --since 1h worker > /tmp/worker-1h.jsonl
    wc -l /tmp/api-1h.jsonl /tmp/worker-1h.jsonl     # так: обидва > 0
    ```
 
@@ -255,9 +282,15 @@ sudo -u postgres psql -d poshtomat -c "select count(*) as waiting_locks from pg_
   `waiting_locks` > 0. Якщо `pgrep` знаходить `backup.sh` і зараз 02:00–02:30, це штатний
   бекап: він тримає блокування на запис (`docs/ops/backup-runbook.md`, п. 1). `POST /pickup`
   оновлює посилку (`app/src/parcels.js:64-66`), тому видача теж чекатиме.
-  О 03:15 cron ще запускає `docker compose run --rm worker npm run expire`. Його видно в
-  `docker compose -f deploy/compose.yaml ps -a` як окремий контейнер з власним пулом
-  (`app/bin/expire-parcels.js:24`).
+- **Нічна задача `expire` і старі команди з backup-runbook:** о 03:15 cron запускає
+  `cd /opt/poshtomat && docker compose run --rm expire` (сервіс `expire` з профілем `jobs`, з
+  `up` не стартує, `deploy/compose.yaml:61-71`). Її видно в
+  `docker compose --profile jobs ps -a` як окремий контейнер з власним пулом
+  (`app/bin/expire-parcels.js:24`). `docs/ops/backup-runbook.md:18-19` ще називає стару форму
+  (`docker compose run --rm worker npm run expire`), а `:32` —
+  `docker compose -f deploy/compose.yaml stop api worker`; на новій схемі це
+  `cd /opt/poshtomat && docker compose stop api worker`. У cron на VM має бути **рівно одна**
+  з форм нічної задачі, інакше `expire` піде двічі.
 
 ### Відомі хибні сліди
 
@@ -288,7 +321,7 @@ API**. Справжня проблема з SMS — це коли `"sms batch se
 
 ```bash
 grep -c '"heap usage high"' /tmp/api-1h.jsonl
-docker inspect -f 'status={{.State.Status}} OOMKilled={{.State.OOMKilled}} restarts={{.RestartCount}} started={{.State.StartedAt}}' $(docker compose -f deploy/compose.yaml ps -q api)
+docker inspect -f 'status={{.State.Status}} OOMKilled={{.State.OOMKilled}} restarts={{.RestartCount}} started={{.State.StartedAt}}' $(docker compose ps -q api)
 ```
 
 Попередження пишеться, коли heap ≥ 75 % (`app/src/server.js:83`). Це нормальна пилка GC.
@@ -350,8 +383,8 @@ ts,rps,p95_ms,error_rate,db_pool_in_use,db_pool_waiting
 взялася назва змінної, видно, якщо порівняти, що задає compose і що читає код:
 
 ```bash
-docker compose -f deploy/compose.yaml config | grep -E '^ +DB_POOL'
-docker compose -f deploy/compose.yaml exec -T api grep -n 'DB_POOL' src/config.js
+docker compose config | grep -E '^ +DB_POOL'
+docker compose exec -T api grep -n 'DB_POOL' src/config.js
 ```
 
 На даних інциденту (`grep -n 'DB_POOL' incident/changes/v1.8.0.diff` і `grep -n 'DB_POOL' app/src/config.js`):
@@ -397,8 +430,8 @@ awk -F'"' '$4 >= "<ЧАС>"' /tmp/api-1h.jsonl | grep '"msg":"request failed"' |
 
 | Ситуація | Дія | Команда | Ризик / що перевірити після |
 |---|---|---|---|
-| 1. Пейдж прийшов протягом години після деплою або зміни конфігу (крок 3 = «так»), незалежно від гілки | **Відкат** на попередню версію: **і код, і `compose.yaml`** | блок «Відкат» нижче | Секунди недоступності під час перестворення. Образ `poshtomat:latest` збирається з `app/` (`deploy/compose.yaml:5-8`), версійного тегу немає, тож відкат = перезбірка зі старого коду; `FROM node:latest` (`deploy/Dockerfile:1`) може підтягнути новішу Node. **Після:** `/health` показує стару версію, Д2 = `dbPoolMax=20`, Д5 = 403, далі «Як переконатися». 14.10 сервіс відновився за хвилину після відкату |
-| 2. Д2 показує неправильний пул, а відкат неможливий або версія потрібна | Виправити назву або значення змінної в `deploy/compose.yaml` для **обох** сервісів і **перестворити** контейнери | блок «Виправити env» нижче | Ручна правка на VM розходиться з git, тому виправлення треба окремо внести в репо (ескалація до автора релізу). **Після:** Д2 = `dbPoolMax=20`, у `/proc/1/environ` є `DB_POOL_MAX=20` |
+| 1. Пейдж прийшов протягом години після деплою або зміни конфігу (крок 3 = «так»), незалежно від гілки | **Відкат** на попередню версію: **і код, і `compose.yaml`** | блок «Відкат» нижче | Секунди недоступності під час перестворення. Образ задано за digest (`deploy/compose.yaml:11`), тож відкат повертає саме попередній образ. Автовідкат пайплайна такий інцидент не ловить: `/health` завжди 200. **Після:** перевірки з блоку «Відкат», Д5 = 403, далі «Як переконатися». 14.10 сервіс відновився за хвилину після відкату |
+| 2. Д2 показує неправильний пул, а відкат неможливий або версія потрібна | Виправити назву або значення змінної в `/opt/poshtomat/compose.yaml` (вона задається один раз у блоці `x-env`, `deploy/compose.yaml:31-39`, для `api`, `worker` і `expire`) і **перестворити** контейнери | блок «Виправити env і перестворити» нижче | Правку треба внести в репо (див. блок): ескалація до автора релізу. **Після:** Д2 = `dbPoolMax=20`, у `/proc/1/environ` є `DB_POOL_MAX=20` |
 | 3. Хочеться «просто перезапустити» | **Не допоможе, якщо причина в конфігу.** `docker compose restart` не перечитує `compose.yaml` і піднімає процес з тим самим оточенням | — | 14.10 рестарт о 14:20 на тій самій версії дав одну хвилину з `waiting` 6, а о 14:21 знову `in_use` 4, `waiting` 20 (`docs/rca.md`, #18). Рестарт має сенс лише тоді, коли процес завис, а конфіг (Д2) у нормі |
 | 4. Бекап 02:00–02:30 тримає блокування (Д8) | Не чіпати бекап. Написати в `#poshtomat-oncall`, що причина — вікно бекапу, і чекати 02:30 | `sudo tail -n 3 /var/log/poshtomat/backup.log` | Якщо зупинити бекап, лишиться неузгоджена копія (`docs/ops/backup-runbook.md`). **Після 02:30:** Д5 = 403. Якщо не відпустило — ескалація до власника БД. Повторюваність варто винести на розбір |
 | 5. Довгі запити або блокування в PostgreSQL поза вікном бекапу (Д6–Д8) | Ескалація до власника БД. Скасувати конкретний запит **лише за його згодою** | `sudo -u postgres psql -d poshtomat -c "select pg_cancel_backend(<PID з Д7>);"` (наприклад `pg_cancel_backend(48213)`) | Можна скасувати чужу важливу операцію (бекап, міграцію, `expire`). **Після:** Д7 без довгих запитів, `db_pool_in_use` нижче 20, Д5 = 403 |
@@ -406,33 +439,92 @@ awk -F'"' '$4 >= "<ЧАС>"' /tmp/api-1h.jsonl | grep '"msg":"request failed"' |
 | 7. Пул упирається в 20 через трафік, БД здорова | Ескалація. Самостійно вночі `DB_POOL_MAX` не піднімати | — | Більший пул означає більше з'єднань до PostgreSQL, а `max_connections` = 100 (дефолт). Уже зараз api 20 + worker 20 + нічний `expire` 20 = 60 зі 100, тож підняття `DB_POOL_MAX` вирішує лише ескалація, не черговий уночі |
 | 8. API в нормі (Д3 без пулових 503, Д5 = 403), горять лише 429 / heap / TLS | Нічого не робити вночі, записати в чат | — | Див. «Відомі хибні сліди» |
 
-**Відкат.** На VM у `/opt/poshtomat/repo` лежить git-checkout репо з тегами версій. Відкат —
-це `git checkout <ПОПЕРЕДНЯ_ВЕРСІЯ>` (наприклад `v1.7.3`) і `docker compose up -d --build`.
+**Відкат.** Пайплайн, коли деплой щось змінює (образ, `compose.yaml` або секрети), зберігає
+попередні `compose.yaml`, `.env` і `secrets.env` як `*.prev`, лише на один крок назад.
+Попередній образ ще є на VM, тож відкат нічого не збирає і не тягне. Файли належать
+користувачу деплою, а `secrets.env*` мають права 0600, тому команди нижче виконуйте від нього
+(`sudo -u <DEPLOY_USER> …` або увійшовши під ним).
+
+Спершу подивіться, чи є куди відкочуватися:
 
 ```bash
-cd /opt/poshtomat/repo
-git status --short                   # так: порожньо; ні: хтось правив файли на VM — напишіть у чат, що саме, і не губіть цих змін
-git describe --tags                  # яка версія зараз
-tail -n 3 /opt/poshtomat/deploys.log # яка була перед нею: колонка version
-git checkout <ПОПЕРЕДНЯ_ВЕРСІЯ>       # наприклад v1.7.3; повертає і app/, і deploy/compose.yaml
-docker compose -f deploy/compose.yaml up -d --build api worker
-curl -s -m 5 http://localhost:8080/health; echo   # так: "version" = попередня версія
+cd /opt/poshtomat
+tail -n 5 deploys.log                # останні записи: дія, sha, хто, образ
+ls .env.prev                         # немає → «Запасний варіант» нижче
+for f in compose.yaml .env secrets.env; do cmp -s "$f" "$f.prev" || echo "$f відрізняється"; done
 ```
+
+Далі перша гілка, що підходить:
+
+- **(а) `.env.prev` немає** → «Запасний варіант» нижче: за новою схемою був лише один деплой
+  або жодного, і попередній стан є лише на старій схемі.
+- **(б) Останній рядок журналу — `failed` без `rollback` після нього** → автовідкат не піднявся.
+  Ескалація до розробника; паралельно `docker compose ps` і `docker compose logs --tail 50 api worker`.
+- **(в) `cmp` нічого не вивів** → на крок назад відкочуватися нема куди. Або пайплайн уже
+  відкотив сам (у журналі `failed X`, потім `rollback Y`), або щойно відкотили вручну.
+  Повторіть Д2. Якщо проблема лишається, перезапустіть (Re-run) деплой старішого успішного
+  прогону в GitHub Actions (його образ є в GHCR) і ескалюйте до розробника.
+- **(г) Інакше** — відкат з `*.prev`:
+
+  ```bash
+  cat .env .env.prev                   # що зараз і на що відкочуємося (POSHTOMAT_IMAGE, POSHTOMAT_SHA); секретів тут немає
+  for f in compose.yaml .env secrets.env; do cp -p "$f" "$f.before-oncall"; done   # зберегти поточний стан
+  for f in compose.yaml .env secrets.env; do cp -p "$f.prev" "$f"; done            # повернути і образ, і compose.yaml, і секрети
+  docker compose up -d --wait api worker
+  docker compose ps --format '{{.Service}} {{.Image}}'   # так: в api і worker той самий образ, що й POSHTOMAT_IMAGE нижче
+  grep '^POSHTOMAT_IMAGE=' .env
+  curl -s -m 5 http://localhost:8080/health; echo        # так: відповідає (лише «живий»)
+  ```
+
+  `"version"` з `/health` — це версія з `app/package.json` (`app/src/version.js:3-5`). У
+  сусідніх релізів вона може бути однакова, тож чи відкотився образ, перевіряйте за
+  `docker compose ps`.
+
+  Потім повторіть Д2 (так: `dbPoolMax=20`) і допишіть відкат у журнал, у форматі пайплайна:
+
+  ```bash
+  to=$(sed -n 's/^POSHTOMAT_SHA=//p' .env); failed=$(sed -n 's/^POSHTOMAT_SHA=//p' .env.before-oncall)
+  printf '%s   rollback  %s  %s  failed %s\n' "$(date -Iseconds)" "${to:-unknown}" "<ХТО>" "${failed:-unknown}" >> deploys.log
+  tail -n 1 deploys.log
+  ```
 
 Відкочувати треба **разом з `compose.yaml`**. 14.10 код API у v1.7.3 і v1.8.0 був
 однаковий, а сервіс полагодило повернення `DB_POOL_MAX` (`docs/rca.md`, «Першопричина», п. 5).
 
+**Запасний варіант: немає `.env.prev`.** Отже, за новою схемою був лише один деплой або
+жодного (перший деплой `*.prev` не створює), і попередній стан є лише на старій схемі:
+git-checkout у `/opt/poshtomat/repo`, образ збирається на VM. Якщо новий стек запущено, він
+тримає порт 8080, тож спершу зупиніть його:
+
+```bash
+cd /opt/poshtomat && docker compose stop api worker
+cd /opt/poshtomat/repo
+git status --short                   # так: порожньо; ні: хтось правив файли на VM — напишіть у чат і не губіть цих змін
+git checkout <ПОПЕРЕДНЯ_ВЕРСІЯ>       # наприклад v1.7.3; повертає і app/, і deploy/compose.yaml
+docker compose -f deploy/compose.yaml up -d --build api worker
+curl -s -m 5 http://localhost:8080/health; echo   # так: відповідає; "version" може збігатися із сусіднім релізом
+```
+
+На старій схемі решта команд runbook запускається з `/opt/poshtomat/repo` як
+`docker compose -f deploy/compose.yaml …`. Старий стек тепер тримає 8080, тож перед наступним
+деплоєм пайплайна його треба зупинити: `cd /opt/poshtomat/repo && docker compose -f deploy/compose.yaml down`.
+
 **Виправити env і перестворити.**
 
 ```bash
-grep -n 'DB_POOL' deploy/compose.yaml     # шукайте назву, яку код не читає (код читає лише DB_POOL_MAX і DB_POOL_WAIT_MS)
-cp deploy/compose.yaml deploy/compose.yaml.before-oncall
-sed -i.bak 's/DB_POOL_SIZE:/DB_POOL_MAX:/' deploy/compose.yaml   # приклад для випадку 14.10; підставте свою назву
-grep -n 'DB_POOL' deploy/compose.yaml     # так: в api і worker стоїть DB_POOL_MAX: "20"
-docker compose -f deploy/compose.yaml up -d api worker            # саме up -d, не restart: лише так нове оточення потрапить у контейнер
+cd /opt/poshtomat
+grep -n 'DB_POOL' compose.yaml     # шукайте назву, яку код не читає (код читає лише DB_POOL_MAX і DB_POOL_WAIT_MS)
+cp -p compose.yaml compose.yaml.before-oncall
+sed -i.bak 's/DB_POOL_SIZE:/DB_POOL_MAX:/' compose.yaml   # приклад для випадку 14.10; підставте свою назву
+grep -n 'DB_POOL' compose.yaml     # так: стоїть DB_POOL_MAX: "20" (у поточному compose — один раз, у блоці x-env для всіх сервісів)
+docker compose up -d api worker    # саме up -d, не restart: лише так нове оточення потрапить у контейнер
 ```
 
-Потім повторіть Д2. Ви маєте побачити `dbPoolMax=20 dbPoolWaitMs=2000`.
+Потім повторіть Д2. Ви маєте побачити `dbPoolMax=20 dbPoolWaitMs=2000`. Наступний деплой
+перезапише `/opt/poshtomat/compose.yaml` версією з репо, тож ту саму правку внесіть у
+`deploy/compose.yaml` у репо і перевірте `node tools/check-deploy.mjs` (звірку назв з кодом робить правило E1).
+У CI крок перевірки конфігу запускає правила D*, C* і E1, але не W*: W-правила перевіряють сам
+workflow за шляхом `pipeline/deploy.yml`, а в робочому репо він лежить у `.github/workflows/`.
 
 ## Коли ескалювати і кого кликати
 
@@ -440,7 +532,7 @@ docker compose -f deploy/compose.yaml up -d api worker            # саме up 
 Пошта команди — `poshtomat-team@example.org`.
 
 - **Відкат зроблено, а через 10 хв Д5 і далі дає 503** або `p95_ms` > 2000 (тоді й автор
-  останнього релізу, колонка `by` у журналі деплоїв), **або через 15 хв після пейджа не
+  останнього релізу, колонка «хто» в `deploys.log`), **або через 15 хв після пейджа не
   вдалося визначити гілку, а деплою не було** → розробник на зв'язку: `#poshtomat-dev`,
   телефон `+380000000101`.
 - **Гілка Б (PostgreSQL), будь-який `pg_cancel_backend`, бекап не відпустив після 02:30** →
@@ -486,13 +578,13 @@ db_pool_waiting 0..0
 
 ```bash
 # пулових таймаутів за останні 5 хв немає
-docker compose -f deploy/compose.yaml logs --no-log-prefix --since 5m api | grep -c 'db pool wait timeout'   # так: 0
+docker compose logs --no-log-prefix --since 5m api | grep -c 'db pool wait timeout'   # так: 0
 # 5xx за останні 5 хв — лише фонові, якщо є
-docker compose -f deploy/compose.yaml logs --no-log-prefix --since 5m api | grep '"msg":"request failed"' | sed -E 's/.*"path":"([^"]*)","status":([0-9]+).*"error":"([^"]*)".*/\2 \1 \3/' | sort | uniq -c
+docker compose logs --no-log-prefix --since 5m api | grep '"msg":"request failed"' | sed -E 's/.*"path":"([^"]*)","status":([0-9]+).*"error":"([^"]*)".*/\2 \1 \3/' | sort | uniq -c
 # проба через пул (Д5): усі 10 рядків — 403 за десятки мс
 for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -m 10 -o /dev/null -w '%{http_code} %{time_total}s\n' -H 'Authorization: Bearer runbook-probe' http://localhost:8080/admin/parcels; done
 # пул правильний (Д2)
-docker compose -f deploy/compose.yaml exec -T api node -e 'import("./src/config.js").then((m) => { const c = m.loadConfig(); console.log("dbPoolMax=" + c.dbPoolMax, "dbPoolWaitMs=" + c.dbPoolWaitMs); })'   # так: dbPoolMax=20
+docker compose exec -T api node -e 'import("./src/config.js").then((m) => { const c = m.loadConfig(); console.log("dbPoolMax=" + c.dbPoolMax, "dbPoolWaitMs=" + c.dbPoolWaitMs); })'   # так: dbPoolMax=20
 ```
 
 **Скільки дивитися:** щонайменше **15 хв** поспіль у нормі, і лише тоді оголошувати
@@ -503,6 +595,7 @@ docker compose -f deploy/compose.yaml exec -T api node -e 'import("./src/config.
 
 **Після відновлення:**
 - напишіть у `#poshtomat-oncall`, що зроблено і о котрій;
-- додайте запис у журнал деплоїв: дія, версія, хто (так, як 14.10 записали `restart` і `rollback`);
+- якщо відкочували вручну, перевірте, що в `deploys.log` є рядок `rollback` (блок «Відкат»);
 - якщо `compose.yaml` правили руками (рядок 2 у «Що робити»), передайте правку автору релізу,
-  щоб її внесли в репо. Інакше наступний деплой поверне проблему.
+  щоб її внесли в `deploy/compose.yaml` у репо. Інакше наступний деплой перезапише
+  `/opt/poshtomat/compose.yaml` і поверне проблему.

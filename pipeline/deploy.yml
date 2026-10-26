@@ -15,6 +15,10 @@
 #
 # Екшени сторонніх авторів не використовуються; actions/checkout варто закріпити за
 # commit SHA (Dependabot для github-actions оновлюватиме його).
+#
+# Перший деплой за цією схемою — міграція зі старого стеку (/opt/poshtomat/repo,
+# `docker compose -f deploy/compose.yaml`): його треба один раз зупинити вручну, бо він
+# тримає порт 8080, а автовідкату на першому деплої немає (ще немає *.prev).
 
 name: deploy
 
@@ -45,6 +49,12 @@ jobs:
       - name: Unit tests
         working-directory: app
         run: npm test
+      # Правила check-deploy для Dockerfile і compose, зокрема E1: env у compose звіряється
+      # з app/src/config.js (action item #1 з docs/postmortem.md). W-правила перевіряють сам
+      # workflow за шляхом pipeline/deploy.yml — тут він лежить у .github/workflows/.
+      - name: Check deploy config
+        run: |
+          node --input-type=module -e 'import { RULES, runChecks, loadContext, formatReport } from "./tools/check-deploy.mjs"; const r = runChecks(loadContext("."), RULES.filter((x) => !x.id.startsWith("W"))); process.stdout.write(formatReport(r)); if (r.some((x) => x.status === "FAIL")) process.exitCode = 1;'
 
   compose-check:
     runs-on: ubuntu-24.04
@@ -146,12 +156,13 @@ jobs:
           SMS_TOKEN: ${{ secrets.SMS_TOKEN }}
         run: |
           for v in DATABASE_URL SMS_TOKEN; do
-            if [ -z "${!v}" ] || [[ "${!v}" == *$'\n'* ]]; then echo "::error::secret $v is empty or multiline"; exit 1; fi
+            if [ -z "${!v}" ] || [[ "${!v}" == *$'\n'* ]] || [[ "${!v}" == *"'"* ]]; then echo "::error::secret $v is empty, multiline or contains a single quote"; exit 1; fi
           done
           ssh vm "mkdir -p '$APP_DIR'"
           scp -q deploy/compose.yaml "vm:$APP_DIR/compose.yaml.new"
           # Секрети йдуть через stdin, а не аргументами: не потрапляють у ps і логи.
-          printf 'DATABASE_URL=%s\nSMS_TOKEN=%s\n' "$DATABASE_URL" "$SMS_TOKEN" \
+          # Одинарні лапки: compose не інтерполює $ у значеннях.
+          printf "DATABASE_URL='%s'\nSMS_TOKEN='%s'\n" "$DATABASE_URL" "$SMS_TOKEN" \
             | ssh vm "umask 077 && cat > '$APP_DIR/secrets.env.new'"
 
       - name: Log in to GHCR on VM
@@ -161,34 +172,51 @@ jobs:
 
       - name: Roll out (rolls back on failed healthcheck)
         run: |
-          ssh vm bash -s -- "$APP_DIR" "$IMAGE" <<'REMOTE'
+          ssh vm bash -s -- "$APP_DIR" "$IMAGE" "${GITHUB_SHA::7}" "$GITHUB_ACTOR" <<'REMOTE'
           set -euo pipefail
-          dir="$1"; image="$2"
+          dir="$1"; image="$2"; sha="$3"; actor="$4"
           cd "$dir"
 
-          # Зберігаємо попередній стан для відкату.
-          for f in compose.yaml secrets.env .env; do
-            if [ -f "$f" ]; then cp -p "$f" "$f.prev"; fi
-          done
+          # Тягнемо образ до будь-яких змін на диску: якщо pull впаде, конфігурація лишиться стара.
+          docker pull "$image"
+
+          # Зберігаємо попередній стан для відкату, лише якщо деплой щось змінює (образ,
+          # compose.yaml або secrets.env): деплой без змін не затирає точку відкату.
+          # На першому деплої поточних файлів ще немає, тож і *.prev не з'являться.
+          if ! { [ -f .env ] && grep -qxF "POSHTOMAT_IMAGE=$image" .env \
+                 && cmp -s compose.yaml.new compose.yaml && cmp -s secrets.env.new secrets.env; }; then
+            for f in compose.yaml secrets.env .env; do
+              if [ -f "$f" ]; then cp -p "$f" "$f.prev"; fi
+            done
+          fi
 
           mv compose.yaml.new compose.yaml
           mv secrets.env.new secrets.env
-          umask 077; printf 'POSHTOMAT_IMAGE=%s\n' "$image" > .env
+          # Секретів у .env немає; secrets.env лишається 0600 (cp -p/mv зберігають права).
+          printf 'POSHTOMAT_IMAGE=%s\nPOSHTOMAT_SHA=%s\n' "$image" "$sha" > .env
 
-          docker compose pull api worker
           if docker compose up -d --remove-orphans --wait --wait-timeout 90; then
             echo "Deployed $image"
+            # Журнал для runbook чергового (формат як incident/deploys.log).
+            printf '%s   deploy    %s  %s  %s\n' "$(date -Iseconds)" "$sha" "$actor" "$image" >> "$dir/deploys.log"
             exit 0
           fi
 
           echo "::error::new release is unhealthy, rolling back"
           docker compose logs --tail 50 api worker || true
+          # Одразу, до спроби відкату: якщо відкат не підніметься, останнім лишиться цей рядок.
+          printf '%s   failed    %s  %s  %s\n' "$(date -Iseconds)" "$sha" "$actor" "$image" >> "$dir/deploys.log"
           if [ -f .env.prev ]; then
+            # Копіюємо, а не переміщуємо: *.prev лишаються точкою відкату.
             for f in compose.yaml secrets.env .env; do
-              if [ -f "$f.prev" ]; then mv "$f.prev" "$f"; fi
+              if [ -f "$f.prev" ]; then cp -p "$f.prev" "$f"; fi
             done
             docker compose up -d --remove-orphans --wait --wait-timeout 90
             echo "Rolled back to $(cat .env)"
+            # Друге поле — sha, на який відкотилися; у .env, записаному до цієї схеми,
+            # POSHTOMAT_SHA немає → unknown.
+            prev_sha="$(sed -n 's/^POSHTOMAT_SHA=//p' .env)"
+            printf '%s   rollback  %s  %s  failed %s\n' "$(date -Iseconds)" "${prev_sha:-unknown}" "$actor" "$sha" >> "$dir/deploys.log"
           fi
           exit 1
           REMOTE

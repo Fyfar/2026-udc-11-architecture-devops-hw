@@ -623,6 +623,52 @@ export const RULES = [
       return problems.length ? fail(`не закріплено: ${problems.join("; ")}`) : pass(`закріплено: ${count}`);
     },
   },
+  {
+    id: "E1",
+    title: "Змінні оточення в compose — ті, що читає застосунок",
+    hint: "Перейменовану в compose змінну перейменуйте і в app/src/config.js (або поверніть стару назву). Змінні середовища виконання (TZ, NODE_ENV, NODE_OPTIONS) — у списку винятків правила. DB_POOL_MAX обов'язковий: без нього застосунок тихо бере дефолт 4.",
+    check({ root, compose }) {
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      const configPath = "app/src/config.js";
+      const full = join(root, configPath);
+      if (!existsSync(full)) return fail(`${configPath} не знайдено — нема з чим звірити compose`);
+      // exact names after `env.`, not substrings
+      const read = new Set([...readFileSync(full, "utf8").matchAll(/\benv\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]));
+      // read by Node / the OS, not by config.js
+      const runtime = new Set(["TZ", "NODE_ENV", "NODE_OPTIONS"]);
+      // `Number(x) || 4` in config.js silently defaults on a missing, empty or non-numeric value:
+      // set means a value matching the pattern or a required reference ${VAR:?…}
+      const required = { DB_POOL_MAX: /^[1-9]\d*$/ };
+      const requiredRef = /^\$\{[A-Za-z_][A-Za-z0-9_]*:\?[^}]*\}$/;
+      // Not covered: a third-party service (e.g. postgres) would need its own exception; env_file: variables are not checked
+      const problems = [];
+      let count = 0;
+      for (const [name, svc] of services(compose)) {
+        const entries = envEntries(svc?.environment);
+        for (const [key] of entries) {
+          count += 1;
+          if (!read.has(key) && !runtime.has(key)) problems.push(`${name}: ${key} — ${configPath} його не читає`);
+        }
+        for (const [key, pattern] of Object.entries(required)) {
+          const entry = entries.find(([k]) => k === key);
+          if (!entry) {
+            problems.push(`${name}: немає ${key} — застосунок тихо візьме дефолт`);
+            continue;
+          }
+          const value = entry[1];
+          if (value === null || value === undefined) {
+            problems.push(`${name}: ${key} без значення (береться з оболонки) — може тихо стати дефолтом`);
+          } else if (!pattern.test(String(value)) && !requiredRef.test(String(value))) {
+            problems.push(`${name}: ${key}="${value}" — не додатне ціле і не \${…:?}, застосунок тихо візьме дефолт`);
+          }
+        }
+      }
+      return problems.length
+        ? fail(problems.join("; "))
+        : pass(`${count} змінних у ${services(compose).length} сервісах збігаються з ${configPath}`);
+    },
+  },
 ];
 
 // ---------------------------------------------------------------- running

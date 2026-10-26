@@ -1,8 +1,8 @@
 # Образ для api, worker і нічної задачі expire. Збирається з контекстом ../app:
 #   docker build -f deploy/Dockerfile app
 #
-# Версія Node зафіксована (package.json: engines.node >=22). Для повної відтворюваності
-# допиши digest: FROM node:22.20-bookworm-slim@sha256:<digest>
+# Зафіксовано мажорну версію Node 22 (package.json: engines.node >=22). Для повної
+# відтворюваності закріпіть точну версію і digest: FROM node:22.<x>-bookworm-slim@sha256:<digest>
 FROM node:22-bookworm-slim
 
 ENV NODE_ENV=production
