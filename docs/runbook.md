@@ -35,8 +35,10 @@ _Власник: керівник on-call ротації. Складено 2026-
 Будь-яка інша неперехоплена помилка дає `500 {"error":"internal error"}`.
 
 **Як деплоїться** (`pipeline/deploy.yml`, `deploy/compose.yaml:1-8`). Образ збирає CI і пушить у
-GHCR; на VM нічого не збирається, git-checkout там немає. Усе лежить у каталозі `/opt/poshtomat`,
-файли належать користувачу деплою:
+GHCR; на VM нічого не збирається, git-checkout там немає. На VM потрібен Docker Compose
+**≥ 2.24** (`docker compose version`): старіший не розбирає `env_file:` у `compose.yaml`
+(`services.api.env_file.0 must be a string`), тож пайплайн перевіряє версію до будь-яких змін.
+Усе лежить у каталозі `/opt/poshtomat`, файли належать користувачу деплою:
 
 - `compose.yaml` — копія `deploy/compose.yaml` з репо на момент деплою;
 - `.env` — `POSHTOMAT_IMAGE=<образ@sha256:…>` і `POSHTOMAT_SHA=<коротке sha релізу>`, без секретів;

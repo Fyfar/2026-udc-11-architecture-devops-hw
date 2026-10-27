@@ -177,6 +177,13 @@ jobs:
           dir="$1"; image="$2"; sha="$3"; actor="$4"
           cd "$dir"
 
+          # compose.yaml використовує env_file: {path, required} — його розуміє лише Compose >= 2.24;
+          # старіший падає на розборі вже після заміни файлів. Перевіряємо до будь-яких змін.
+          compose_v="$(docker compose version --short)"
+          if ! printf '2.24.0\n%s\n' "${compose_v#v}" | sort -C -V; then
+            echo "::error::Docker Compose ${compose_v} on VM, need >= 2.24"; exit 1
+          fi
+
           # Тягнемо образ до будь-яких змін на диску: якщо pull впаде, конфігурація лишиться стара.
           docker pull "$image"
 
