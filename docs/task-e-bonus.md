@@ -1,9 +1,12 @@
 # Task E (bonus) — обрано Шлях 1: стек по-справжньому (Docker)
 
-Перевірено 2026-10-27 на macOS (x86_64) двічі: (1) engine 20.10.12 + Docker Compose v2.29.7;
+Перевірено 2026-10-27 на macOS (x86_64) тричі: (1) engine 20.10.12 + Docker Compose v2.29.7;
 (2) після оновлення Docker Desktop до 4.97.0 — engine 29.9.2 + Docker Compose v5.6.1, командою
 пайплайну `up -d --wait --wait-timeout 90` (exit 0). `deploy/Dockerfile` і `deploy/compose.yaml` —
-ті самі, що в Task D, без змін. Вивід нижче — з першого прогону.
+ті самі, що в Task D. Вивід нижче — з першого прогону. Третій прогін (2026-10-27, після зміни
+`SMS_RATE_PER_SEC` з 20 на 8 за post-mortem, дія 6) — так само `up --wait` exit 0, `api` healthy,
+`worker` Up; у worker-і `tr "\0" "\n" < /proc/1/environ | grep "^SMS_RATE"` → `SMS_RATE_PER_SEC=8`
+(та сама команда, що в runbook, Д9).
 
 ## Шлях 1 — стек по-справжньому (Docker)
 

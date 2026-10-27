@@ -34,7 +34,7 @@ x-env: &env
   DB_POOL_MAX: "20"
   DB_POOL_WAIT_MS: "2000"
   SMS_BASE_URL: "https://sms.example.net/api/v2"
-  SMS_RATE_PER_SEC: "20"
+  SMS_RATE_PER_SEC: "8"          # ліміт провайдера 10/с; при 20 кожен раунд понад 10 SMS ловив 429 (docs/rca.md)
   COURIER_BASE_URL: "https://courier.example.com/api/v1"
   # DATABASE_URL і SMS_TOKEN — лише з secrets.env, тут їх навмисно немає
 
