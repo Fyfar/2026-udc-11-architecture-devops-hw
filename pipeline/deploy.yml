@@ -193,7 +193,9 @@ jobs:
           # або compose.yaml): деплой без змін не затирає точку відкату.
           # На першому деплої поточних файлів ще немає, тож і *.prev не з'являться.
           # secrets.env попередньої схеми не чіпаємо: його читає compose.yaml.prev з тієї схеми.
+          changed=0
           if ! { [ -f .env ] && cmp -s .env.new .env && cmp -s compose.yaml.new compose.yaml; }; then
+            changed=1
             for f in compose.yaml .env; do
               if [ -f "$f" ]; then cp -p "$f" "$f.prev"; fi
             done
@@ -222,8 +224,15 @@ jobs:
             exit 0
           fi
 
-          echo "::error::new release is unhealthy, rolling back"
           docker compose logs --tail 50 api worker || true
+          if [ "$changed" = 0 ]; then
+            # Повторний деплой того самого релізу: *.prev — це реліз ДО нього, а не точка відкату
+            # для цього запуску. Збій тут не робить реліз поганим, тож нічого не відкочуємо.
+            echo "::error::перевірка не пройшла, але файли не змінилися — відкату немає, лишається $sha"
+            printf '%s   failed    %s  %s  %s  unchanged\n' "$(date -Iseconds)" "$sha" "$actor" "$image" >> "$dir/deploys.log"
+            exit 1
+          fi
+          echo "::error::new release is unhealthy, rolling back"
           # Одразу, до спроби відкату: якщо відкат не підніметься, останнім лишиться цей рядок.
           printf '%s   failed    %s  %s  %s\n' "$(date -Iseconds)" "$sha" "$actor" "$image" >> "$dir/deploys.log"
           if [ -f .env.prev ]; then

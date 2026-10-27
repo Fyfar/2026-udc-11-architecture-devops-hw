@@ -118,7 +118,7 @@ Task D змінив `deploy/`, тож ці рядки читаються ком�
 | 31 | Перейменування сховалося в «косметичному» сортуванні змінних | `grep -n 'за алфавітом' incident/changes/v1.8.0.diff` | `73:+# Змінні оточення — за алфавітом.` |
 | 32 | У compose v1.7.3 немає healthcheck-а | `git show main:deploy/compose.yaml \| grep -c 'healthcheck'` | `0` |
 | 33 | `pickup()` викликає саме термінал поштомата з кодом, який ввела людина | `grep -n 'locker terminal' app/src/parcels.js` | `58:    /** The locker terminal sends the code the person typed; null = no such waiting parcel. */` |
-| 34 | `error_rate` рахує всі 5xx; у вікні інциденту це майже лише 503: 3380 з 3432 (98,5 %), решта — фоновий 500 на `trim` | `awk -F'"' '$4 >= "2026-10-14T14:02" && $4 < "2026-10-14T14:47"' incident/logs/api-2026-10-14.jsonl \| grep '"msg":"request failed"' \| grep -o '"status":[0-9]*' \| sort \| uniq -c \| sed 's/^ *//'` | `52 "status":500`<br>`3380 "status":503` |
+| 34 | `error_rate` рахує всі 5xx; у вікні інциденту це майже лише 503: 3380 з 3432 (98,5 %), решта 52 — фоновий 500 на `trim` (той самий, що й 13.10, «НЕ є причиною», рядок 4) | `awk -F'"' '$4 >= "2026-10-14T14:02" && $4 < "2026-10-14T14:47"' incident/logs/api-2026-10-14.jsonl \| grep '"msg":"request failed"' \| sed -E 's/.*"path":"([^"]*)","status":([0-9]+).*"error":"([^"]*)".*/\2 \1 \3/' \| sort \| uniq -c \| sort -rn \| sed 's/^ *//'` | `2586 503 /pickup db pool wait timeout after 2000ms`<br>`650 503 /parcels db pool wait timeout after 2000ms`<br>`144 503 /admin/parcels db pool wait timeout after 2000ms`<br>`52 500 /parcels Cannot read properties of undefined (reading 'trim')` |
 
 ## Що з даних НЕ є причиною — і чим це доведено
 

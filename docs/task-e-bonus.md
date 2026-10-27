@@ -72,6 +72,8 @@
   | 2. Той самий compose, але `DB_POOL_SIZE` замість `DB_POOL_MAX`, як у v1.8.0 | `--wait` пройшов (`api` healthy), але перевірка пулу — `::error::api: DB_POOL_MAX не задано, код візьме дефолт 4` → відкат, exit 1. У виводі жодного значення секретів | `failed bbbbbbb`, `rollback aaaaaaa … failed bbbbbbb` |
   | 3. Знову деплой 1, без змін | `Deployed`; `.env.prev` не змінився (той самий md5) | `deploy aaaaaaa` |
   | 4. Compose, якого Compose на VM не розбирає | `config --quiet` зупинив деплой до будь-яких змін на диску | — |
+  | 5. Після A і B — знову B, але проба пулу тимчасово падає (підмінено `curl`) | Відкату немає, працює далі B (`api` healthy), exit 1. До другого рев'ю PR тут був відкат на старіший A із записом `rollback aaaaaaa` | `failed bbbbbbb … unchanged` |
+  | 6. Потім C з `DB_POOL_SIZE` | Відкат на B, тобто на попередній реліз, а не на A | `failed ccccccc`, `rollback bbbbbbb … failed ccccccc` |
 
   До рев'ю PR деплой 2 закінчувався б `Deployed`: `up --wait` з таким compose дає exit 0, а
   `/health` — 200 (`docker compose exec -T api printenv DB_POOL_MAX` → exit 1, `dbPoolMax=4`).
