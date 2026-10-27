@@ -67,9 +67,8 @@ jobs:
           persist-credentials: false
       - name: Validate compose.yaml
         working-directory: deploy
-        run: |
-          touch secrets.env
-          POSHTOMAT_IMAGE=example.invalid/poshtomat:check docker compose -f compose.yaml config --quiet
+        # Лише схема: значень ${…:?} тут немає, обов'язкові змінні перевіряє деплой на VM.
+        run: docker compose -f compose.yaml config --no-interpolate --quiet
 
   build:
     needs: [test, compose-check]
@@ -161,9 +160,9 @@ jobs:
           ssh vm "mkdir -p '$APP_DIR'"
           scp -q deploy/compose.yaml "vm:$APP_DIR/compose.yaml.new"
           # Секрети йдуть через stdin, а не аргументами: не потрапляють у ps і логи.
-          # Одинарні лапки: compose не інтерполює $ у значеннях.
+          # Одинарні лапки: compose не інтерполює $ у значеннях .env.
           printf "DATABASE_URL='%s'\nSMS_TOKEN='%s'\n" "$DATABASE_URL" "$SMS_TOKEN" \
-            | ssh vm "umask 077 && cat > '$APP_DIR/secrets.env.new'"
+            | ssh vm "umask 077 && cat > '$APP_DIR/secrets.new'"
 
       - name: Log in to GHCR on VM
         env:
@@ -176,33 +175,47 @@ jobs:
           set -euo pipefail
           dir="$1"; image="$2"; sha="$3"; actor="$4"
           cd "$dir"
+          umask 077                    # .env і *.prev містять секрети
 
-          # compose.yaml використовує env_file: {path, required} — його розуміє лише Compose >= 2.24;
-          # старіший падає на розборі вже після заміни файлів. Перевіряємо до будь-яких змін.
-          compose_v="$(docker compose version --short)"
-          if ! printf '2.24.0\n%s\n' "${compose_v#v}" | sort -C -V; then
-            echo "::error::Docker Compose ${compose_v} on VM, need >= 2.24"; exit 1
-          fi
+          # Новий .env: образ, sha і секрети з secrets.new (попередній крок). compose.yaml бере
+          # з нього ${DATABASE_URL:?…} і ${SMS_TOKEN:?…}.
+          { printf 'POSHTOMAT_IMAGE=%s\nPOSHTOMAT_SHA=%s\n' "$image" "$sha"; cat secrets.new; } > .env.new
+          rm -f secrets.new
+
+          # Новий compose.yaml має розібратися тим Compose, що стоїть на VM, — до будь-яких змін
+          # (27.10 Compose 2.2.3 не прочитав файл, docs/task-e-bonus.md). --quiet: без виводу секретів.
+          docker compose --env-file .env.new -f compose.yaml.new config --quiet
 
           # Тягнемо образ до будь-яких змін на диску: якщо pull впаде, конфігурація лишиться стара.
           docker pull "$image"
 
-          # Зберігаємо попередній стан для відкату, лише якщо деплой щось змінює (образ,
-          # compose.yaml або secrets.env): деплой без змін не затирає точку відкату.
+          # Зберігаємо попередній стан для відкату, лише якщо деплой щось змінює (образ, секрети
+          # або compose.yaml): деплой без змін не затирає точку відкату.
           # На першому деплої поточних файлів ще немає, тож і *.prev не з'являться.
-          if ! { [ -f .env ] && grep -qxF "POSHTOMAT_IMAGE=$image" .env \
-                 && cmp -s compose.yaml.new compose.yaml && cmp -s secrets.env.new secrets.env; }; then
-            for f in compose.yaml secrets.env .env; do
+          # secrets.env попередньої схеми не чіпаємо: його читає compose.yaml.prev з тієї схеми.
+          if ! { [ -f .env ] && cmp -s .env.new .env && cmp -s compose.yaml.new compose.yaml; }; then
+            for f in compose.yaml .env; do
               if [ -f "$f" ]; then cp -p "$f" "$f.prev"; fi
             done
           fi
 
           mv compose.yaml.new compose.yaml
-          mv secrets.env.new secrets.env
-          # Секретів у .env немає; secrets.env лишається 0600 (cp -p/mv зберігають права).
-          printf 'POSHTOMAT_IMAGE=%s\nPOSHTOMAT_SHA=%s\n' "$image" "$sha" > .env
+          mv .env.new .env
 
-          if docker compose up -d --remove-orphans --wait --wait-timeout 90; then
+          # /health не звертається до пулу (14.10 відповідав 200 увесь інцидент), тож після --wait
+          # перевіряємо, що api справді отримав DB_POOL_MAX і пул видає з'єднання.
+          pool_ok() {
+            local want got code
+            want="$(docker compose exec -T api printenv DB_POOL_MAX)" \
+              || { echo "::error::api: DB_POOL_MAX не задано, код візьме дефолт 4"; return 1; }
+            got="$(docker compose exec -T api node -e 'import("./src/config.js").then((m) => console.log(m.loadConfig().dbPoolMax))')" || return 1
+            if [ "$want" != "$got" ]; then echo "::error::api: DB_POOL_MAX=$want, а код бере $got"; return 1; fi
+            # неіснуюча сесія: обробник бере з'єднання з пулу, шукає її і відповідає 403
+            code="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer probe-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')" http://127.0.0.1:8080/admin/parcels)" || true
+            if [ "$code" != 403 ]; then echo "::error::проба пулу: $code замість 403"; return 1; fi
+          }
+
+          if docker compose up -d --remove-orphans --wait --wait-timeout 90 && pool_ok; then
             echo "Deployed $image"
             # Журнал для runbook чергового (формат як incident/deploys.log).
             printf '%s   deploy    %s  %s  %s\n' "$(date -Iseconds)" "$sha" "$actor" "$image" >> "$dir/deploys.log"
@@ -215,11 +228,11 @@ jobs:
           printf '%s   failed    %s  %s  %s\n' "$(date -Iseconds)" "$sha" "$actor" "$image" >> "$dir/deploys.log"
           if [ -f .env.prev ]; then
             # Копіюємо, а не переміщуємо: *.prev лишаються точкою відкату.
-            for f in compose.yaml secrets.env .env; do
+            for f in compose.yaml .env; do
               if [ -f "$f.prev" ]; then cp -p "$f.prev" "$f"; fi
             done
             docker compose up -d --remove-orphans --wait --wait-timeout 90
-            echo "Rolled back to $(cat .env)"
+            echo "Rolled back to $(grep '^POSHTOMAT_' .env | tr '\n' ' ')"   # без секретів з .env
             # Друге поле — sha, на який відкотилися; у .env, записаному до цієї схеми,
             # POSHTOMAT_SHA немає → unknown.
             prev_sha="$(sed -n 's/^POSHTOMAT_SHA=//p' .env)"
@@ -231,5 +244,5 @@ jobs:
       - name: Clean up
         if: always()
         run: |
-          ssh vm "docker logout ghcr.io; rm -f '$APP_DIR/compose.yaml.new' '$APP_DIR/secrets.env.new'" || true
+          ssh vm "docker logout ghcr.io; rm -f '$APP_DIR/compose.yaml.new' '$APP_DIR/secrets.new' '$APP_DIR/.env.new'" || true
           rm -f ~/.ssh/deploy_key

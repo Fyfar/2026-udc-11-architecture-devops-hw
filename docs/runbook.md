@@ -32,7 +32,7 @@ _Власник: керівник on-call ротації. Складено 2026-
    ```bash
    ssh poshtomat-prod-1
    cd /opt/poshtomat              # каталог деплою, без git-checkout; скрипти бекапу лежать тут же (docs/ops/backup-runbook.md)
-   ls compose.yaml .env secrets.env   # так: усі три є → далі; ні: прод ще на старій схемі (/opt/poshtomat/repo, docker compose -f deploy/compose.yaml), див. «Запасний варіант» у блоці «Відкат»
+   ls compose.yaml .env               # так: обидва є → далі; ні: прод ще на старій схемі (/opt/poshtomat/repo, docker compose -f deploy/compose.yaml), див. «Запасний варіант» у блоці «Відкат»
    ```
 
 1. **Напишіть у `#poshtomat-oncall`, що взяли пейдж.** Наприклад: «взяв(ла) ApiLatencyP95High/Api5xxRateHigh, дивлюсь».
@@ -80,10 +80,12 @@ _Власник: керівник on-call ротації. Складено 2026-
    ```bash
    awk -F'"' '$4 >= "2026-10-14T13:07" && $4 < "2026-10-14T14:07"' incident/logs/api-2026-10-14.jsonl | grep -e '"service started"' -e '"shutting down"'
    ```
+
    ```text
    {"ts":"2026-10-14T14:01:58.214+03:00","level":"info","msg":"shutting down","signal":"SIGTERM"}
    {"ts":"2026-10-14T14:02:00.087+03:00","level":"info","msg":"service started","version":"1.8.0"}
    ```
+
    Отже, за 5 хв до пейджа вийшла нова версія. Відповідь — «так».
 
 4. **Який пул з'єднань насправді отримав процес?** Перевіряйте завжди, навіть без свіжого
@@ -93,19 +95,20 @@ _Власник: керівник on-call ротації. Складено 2026-
    ```bash
    # Д2: що бачить код (той самий loadConfig, що й сервіс; WORKDIR контейнера — /app)
    docker compose exec -T api node -e 'import("./src/config.js").then((m) => { const c = m.loadConfig(); console.log("dbPoolMax=" + c.dbPoolMax, "dbPoolWaitMs=" + c.dbPoolWaitMs); })'
-   # оточення, з яким стартував процес (PID 1 — docker-init через init: true, deploy/compose.yaml:12; він запускає node з тим самим оточенням)
+   # оточення, з яким стартував процес (PID 1 — docker-init через init: true, deploy/compose.yaml:13; він запускає node з тим самим оточенням)
    docker compose exec -T api sh -c 'tr "\0" "\n" < /proc/1/environ | grep "^DB_POOL"'
    ```
 
    - **Норма:** `dbPoolMax=20 dbPoolWaitMs=2000` і змінні `DB_POOL_MAX=20` та
-     `DB_POOL_WAIT_MS=2000`. Такі значення стоять у `deploy/compose.yaml:34-35` (спільний блок
+     `DB_POOL_WAIT_MS=2000`. Такі значення стоять у `deploy/compose.yaml:32-33` (спільний блок
      `x-env` для api, worker і expire), а у v1.7.3 — у `main:deploy/compose.yaml:16-17`.
-   - **Проблема:** `dbPoolMax=4` означає, що змінна `DB_POOL_MAX` не задана або порожня, і
-     код тихо взяв дефолт для локальної розробки (`app/src/config.js:8-9`). Шукайте в
-     оточенні змінну зі схожою назвою: 14.10 це був `DB_POOL_SIZE=20`, якого код не читає.
+   - **Проблема:** `dbPoolMax=4` означає, що `DB_POOL_MAX` не задана, порожня, `0` або не число
+     (`Number(x) || 4`), і код тихо взяв дефолт для локальної розробки (`app/src/config.js:8-9`:
+     коментар «sensible default for local dev» і сам дефолт). Шукайте в оточенні змінну зі
+     схожою назвою (14.10 це був `DB_POOL_SIZE=20`, якого код не читає) або дивне значення.
      Рішення — «Що робити», рядок 1 або 2.
    - Ці команди не друкують `SMS_TOKEN` і `DATABASE_URL`. Не запускайте замість них `printenv` чи
-     `docker compose config` без `grep`: `config` підставляє і `secrets.env`, тож надрукує
+     `docker compose config` без `grep`: `config` підставляє значення з `.env`, тож надрукує
      обидва секрети.
 
    Приклад на даних інциденту: справжній `loadConfig` з оточенням v1.8.0 (`DB_POOL_SIZE`,
@@ -114,6 +117,7 @@ _Власник: керівник on-call ротації. Складено 2026-
    ```bash
    node -e 'import("./app/src/config.js").then((m) => { for (const env of [{ DB_POOL_SIZE: "20", DB_POOL_WAIT_MS: "2000" }, { DB_POOL_MAX: "20", DB_POOL_WAIT_MS: "2000" }]) { const c = m.loadConfig(env); console.log(Object.keys(env)[0], "-> dbPoolMax=" + c.dbPoolMax, "dbPoolWaitMs=" + c.dbPoolWaitMs); } })'
    ```
+
    ```text
    DB_POOL_SIZE -> dbPoolMax=4 dbPoolWaitMs=2000
    DB_POOL_MAX -> dbPoolMax=20 dbPoolWaitMs=2000
@@ -204,17 +208,21 @@ grep '"msg":"request failed"' /tmp/api-1h.jsonl | cut -c19-23 | uniq -c | tail -
 Для проби **не використовуйте `POST /pickup`**: справжній код видав би посилку.
 
 ```bash
-for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -m 10 -o /dev/null -w '%{http_code} %{time_total}s\n' -H 'Authorization: Bearer runbook-probe' http://localhost:8080/admin/parcels; done
+probe="probe-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"   # неіснуюча сесія, щоразу нова
+for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -m 10 -o /dev/null -w '%{http_code} %{time_total}s\n' -H "Authorization: Bearer $probe" http://localhost:8080/admin/parcels; done
 ```
 
 - `403 0.0…s` в усіх рядках → пул видає з'єднання.
+- `403`, але сотні мс або більше → пул ще видає з'єднання, але черга вже є. Проба послідовна,
+  тож під навантаженням дивіться ще й `db_pool_waiting` на дашборді.
 - `503 2.0…s` (час ≥ `dbPoolWaitMs`) хоча б у частині рядків → пул насичений зараз.
 
 Приклад на коді з репо: той самий обробник з пулом на 1 з'єднання, вільним і зайнятим, та сама проба:
 
 ```bash
-node -e 'Promise.all([import("./app/src/server.js"), import("./app/src/db.js"), import("./app/src/parcels.js")]).then(async ([s, d, p]) => { for (const busy of [false, true]) { const pool = d.createPool({ max: 1, waitMs: 50 }); if (busy) pool.withConnection(() => new Promise((r) => setTimeout(r, 300))); const h = s.createHandler({ parcels: p.createParcels({ pool }), authenticate: s.sessionAuth(pool), log: { info() {}, error() {} } }); const req = { method: "GET", url: "/admin/parcels", headers: { authorization: "Bearer runbook-probe" } }; const res = { writeHead(c) { this.c = c; }, end(b) { console.log(busy ? "пул зайнятий:" : "пул вільний:", this.c, b); } }; await h(req, res); } })'
+node -e 'Promise.all([import("./app/src/server.js"), import("./app/src/db.js"), import("./app/src/parcels.js")]).then(async ([s, d, p]) => { for (const busy of [false, true]) { const pool = d.createPool({ max: 1, waitMs: 50 }); if (busy) pool.withConnection(() => new Promise((r) => setTimeout(r, 300))); const h = s.createHandler({ parcels: p.createParcels({ pool }), authenticate: s.sessionAuth(pool), log: { info() {}, error() {} } }); const req = { method: "GET", url: "/admin/parcels", headers: { authorization: "Bearer probe-" + crypto.randomUUID() } }; const res = { writeHead(c) { this.c = c; }, end(b) { console.log(busy ? "пул зайнятий:" : "пул вільний:", this.c, b); } }; await h(req, res); } })'
 ```
+
 ```text
 пул вільний: 403 {"error":"forbidden"}
 пул зайнятий: 503 {"error":"service busy, try again"}
@@ -241,7 +249,7 @@ sudo -u postgres psql -d poshtomat -c "select count(*) as waiting_locks from pg_
   оновлює посилку (`app/src/parcels.js:64-66`), тому видача теж чекатиме.
 - **Нічна задача `expire` і старі команди з backup-runbook:** о 03:15 cron запускає
   `cd /opt/poshtomat && docker compose run --rm expire` (сервіс `expire` з профілем `jobs`, з
-  `up` не стартує, `deploy/compose.yaml:61-71`). Її видно в
+  `up` не стартує, `deploy/compose.yaml:63-71`). Її видно в
   `docker compose --profile jobs ps -a` як окремий контейнер з власним пулом
   (`app/bin/expire-parcels.js:24`). `docs/ops/backup-runbook.md:18-19` ще називає стару форму
   (`docker compose run --rm worker npm run expire`), а `:32` —
@@ -271,7 +279,7 @@ incident/baseline/worker-2026-10-13.jsonl:2935      ← 429 стільки ж у
 
 Ці 429 спричиняв наш власний темп 20/с при ліміті провайдера 10/с: їх отримував кожен раунд
 worker-а з понад 10 SMS і жоден з ≤ 10 (`docs/rca.md`, «НЕ є причиною», рядок 1). Тепер
-`SMS_RATE_PER_SEC: "8"` (`deploy/compose.yaml:37`), тож норма — ≈ 0 (модель у post-mortem, дія 6, дає 0;
+`SMS_RATE_PER_SEC: "8"` (`deploy/compose.yaml:35`), тож норма — ≈ 0 (модель у post-mortem, дія 6, дає 0;
 на проді ще не перевірено). Якщо 429 знову багато, перевірте темп:
 `docker compose exec -T worker sh -c 'tr "\0" "\n" < /proc/1/environ | grep "^SMS_RATE"'` → так:
 `SMS_RATE_PER_SEC=8`.
@@ -311,6 +319,7 @@ grep -c 'TLS handshake timeout' /tmp/worker-1h.jsonl
 ```bash
 grep "reading 'trim'" incident/baseline/api-2026-10-13.jsonl incident/logs/api-2026-10-14.jsonl | cut -d'"' -f4 | cut -c1-13 | uniq -c
 ```
+
 ```text
    6 2026-10-13T12
   43 2026-10-13T13
@@ -394,8 +403,8 @@ awk -F'"' '$4 >= "<ЧАС>"' /tmp/api-1h.jsonl | grep '"msg":"request failed"' |
 
 | Ситуація | Дія | Команда | Ризик / що перевірити після |
 |---|---|---|---|
-| 1. Пейдж прийшов протягом години після деплою або зміни конфігу (крок 3 = «так»), незалежно від гілки | **Відкат** на попередню версію: **і код, і `compose.yaml`** | блок «Відкат» нижче | Секунди недоступності під час перестворення. Образ задано за digest (`deploy/compose.yaml:11`), тож відкат повертає саме попередній образ. Автовідкат пайплайна такий інцидент не ловить: `/health` завжди 200. **Після:** перевірки з блоку «Відкат», Д5 = 403, далі «Як переконатися». 14.10 сервіс відновився за хвилину після відкату |
-| 2. Д2 показує неправильний пул, а відкат неможливий або версія потрібна | Виправити назву або значення змінної в `/opt/poshtomat/compose.yaml` (вона задається один раз у блоці `x-env`, `deploy/compose.yaml:31-39`, для `api`, `worker` і `expire`) і **перестворити** контейнери | блок «Виправити env і перестворити» нижче | Правку треба внести в репо (див. блок): ескалація до автора релізу. **Після:** Д2 = `dbPoolMax=20`, у `/proc/1/environ` є `DB_POOL_MAX=20` |
+| 1. Пейдж прийшов протягом години після деплою або зміни конфігу (крок 3 = «так»), незалежно від гілки | **Відкат** на попередню версію: **і код, і `compose.yaml`** | блок «Відкат» нижче | Секунди недоступності під час перестворення. Образ задано за digest (`deploy/compose.yaml:12`), тож відкат повертає саме попередній образ. Неправильний `DB_POOL_MAX` автовідкат пайплайна вже ловить (перевірка пулу після деплою, «Довідка»), а інші проблеми, яких не видно з `/health`, — ні. **Після:** перевірки з блоку «Відкат», Д5 = 403, далі «Як переконатися». 14.10 сервіс відновився за хвилину після відкату |
+| 2. Д2 показує неправильний пул, а відкат неможливий або версія потрібна | Виправити назву або значення змінної в `/opt/poshtomat/compose.yaml` (вона задається один раз у блоці `x-env`, `deploy/compose.yaml:29-39`, для `api`, `worker` і `expire`) і **перестворити** контейнери | блок «Виправити env і перестворити» нижче | Правку треба внести в репо (див. блок): ескалація до автора релізу. **Після:** Д2 = `dbPoolMax=20`, у `/proc/1/environ` є `DB_POOL_MAX=20` |
 | 3. Хочеться «просто перезапустити» | **Не допоможе, якщо причина в конфігу.** `docker compose restart` не перечитує `compose.yaml` і піднімає процес з тим самим оточенням | — | 14.10 рестарт о 14:20 на тій самій версії дав одну хвилину з `waiting` 6, а о 14:21 знову `in_use` 4, `waiting` 20 (`docs/rca.md`, #18). Рестарт має сенс лише тоді, коли процес завис, а конфіг (Д2) у нормі |
 | 4. Бекап 02:00–02:30 тримає блокування (Д8) | Не чіпати бекап. Написати в `#poshtomat-oncall`, що причина — вікно бекапу, і чекати 02:30 | `sudo tail -n 3 /var/log/poshtomat/backup.log` | Якщо зупинити бекап, лишиться неузгоджена копія (`docs/ops/backup-runbook.md`). **Після 02:30:** Д5 = 403. Якщо не відпустило — ескалація до власника БД. Повторюваність варто винести на розбір |
 | 5. Довгі запити або блокування в PostgreSQL поза вікном бекапу (Д6–Д8) | Ескалація до власника БД. Скасувати конкретний запит **лише за його згодою** | `sudo -u postgres psql -d poshtomat -c "select pg_cancel_backend(<PID з Д7>);"` (наприклад `pg_cancel_backend(48213)`) | Можна скасувати чужу важливу операцію (бекап, міграцію, `expire`). **Після:** Д7 без довгих запитів, `db_pool_in_use` нижче 20, Д5 = 403 |
@@ -404,9 +413,9 @@ awk -F'"' '$4 >= "<ЧАС>"' /tmp/api-1h.jsonl | grep '"msg":"request failed"' |
 | 8. API в нормі (Д3 без пулових 503, Д5 = 403), горять лише 429 / heap / TLS | Нічого не робити вночі, записати в чат | — | Див. «Відомі хибні сліди» |
 
 **Відкат.** Пайплайн, коли деплой щось змінює (образ, `compose.yaml` або секрети), зберігає
-попередні `compose.yaml`, `.env` і `secrets.env` як `*.prev`, лише на один крок назад.
+попередні `compose.yaml` і `.env` як `*.prev`, лише на один крок назад.
 Попередній образ ще є на VM, тож відкат нічого не збирає і не тягне. Файли належать
-користувачу деплою, а `secrets.env*` мають права 0600, тому команди нижче виконуйте від нього
+користувачу деплою, а `.env*` містять секрети і мають права 0600, тому команди нижче виконуйте від нього
 (`sudo -u <DEPLOY_USER> …` або увійшовши під ним).
 
 Спершу подивіться, чи є куди відкочуватися:
@@ -415,7 +424,7 @@ awk -F'"' '$4 >= "<ЧАС>"' /tmp/api-1h.jsonl | grep '"msg":"request failed"' |
 cd /opt/poshtomat
 tail -n 5 deploys.log                # останні записи: дія, sha, хто, образ
 ls .env.prev                         # немає → «Запасний варіант» нижче
-for f in compose.yaml .env secrets.env; do cmp -s "$f" "$f.prev" || echo "$f відрізняється"; done
+for f in compose.yaml .env; do cmp -s "$f" "$f.prev" || echo "$f відрізняється"; done
 ```
 
 Далі перша гілка, що підходить:
@@ -431,9 +440,9 @@ for f in compose.yaml .env secrets.env; do cmp -s "$f" "$f.prev" || echo "$f в�
 - **(г) Інакше** — відкат з `*.prev`:
 
   ```bash
-  cat .env .env.prev                   # що зараз і на що відкочуємося (POSHTOMAT_IMAGE, POSHTOMAT_SHA); секретів тут немає
-  for f in compose.yaml .env secrets.env; do cp -p "$f" "$f.before-oncall"; done   # зберегти поточний стан
-  for f in compose.yaml .env secrets.env; do cp -p "$f.prev" "$f"; done            # повернути і образ, і compose.yaml, і секрети
+  grep '^POSHTOMAT_' .env .env.prev    # що зараз і на що відкочуємося; лише ці рядки — решта .env секрети
+  for f in compose.yaml .env; do cp -p "$f" "$f.before-oncall"; done   # зберегти поточний стан
+  for f in compose.yaml .env; do cp -p "$f.prev" "$f"; done            # повернути і образ, і секрети, і compose.yaml
   docker compose up -d --wait api worker
   docker compose ps --format '{{.Service}} {{.Image}}'   # так: в api і worker той самий образ, що й POSHTOMAT_IMAGE нижче
   grep '^POSHTOMAT_IMAGE=' .env
@@ -527,6 +536,7 @@ workflow за шляхом `pipeline/deploy.yml`, а в робочому реп�
 node -e 'const [f, from] = process.argv.slice(1); const [head, ...rows] = require("fs").readFileSync(f, "utf8").trim().split("\n"); const h = head.split(","); const L = rows.map((r) => r.split(",")).filter((r) => r[0].slice(11, 16) >= from); for (const i of [2, 3, 4, 5]) { const v = L.map((r) => +r[i]); console.log(h[i], Math.min(...v) + ".." + Math.max(...v)); }' incident/baseline/metrics-2026-10-13.csv 12:00
 node -e 'const [f, from] = process.argv.slice(1); const [head, ...rows] = require("fs").readFileSync(f, "utf8").trim().split("\n"); const h = head.split(","); const L = rows.map((r) => r.split(",")).filter((r) => r[0].slice(11, 16) >= from); for (const i of [2, 3, 4, 5]) { const v = L.map((r) => +r[i]); console.log(h[i], Math.min(...v) + ".." + Math.max(...v)); }' incident/metrics/2026-10-14.csv 14:48
 ```
+
 ```text
 p95_ms 140..260
 error_rate 0..0.0069
@@ -546,7 +556,8 @@ docker compose logs --no-log-prefix --since 5m api | grep -c 'db pool wait timeo
 # 5xx за останні 5 хв — лише фонові, якщо є
 docker compose logs --no-log-prefix --since 5m api | grep '"msg":"request failed"' | sed -E 's/.*"path":"([^"]*)","status":([0-9]+).*"error":"([^"]*)".*/\2 \1 \3/' | sort | uniq -c
 # проба через пул (Д5): усі 10 рядків — 403 за десятки мс
-for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -m 10 -o /dev/null -w '%{http_code} %{time_total}s\n' -H 'Authorization: Bearer runbook-probe' http://localhost:8080/admin/parcels; done
+probe="probe-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"   # неіснуюча сесія, щоразу нова
+for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -m 10 -o /dev/null -w '%{http_code} %{time_total}s\n' -H "Authorization: Bearer $probe" http://localhost:8080/admin/parcels; done
 # пул правильний (Д2)
 docker compose exec -T api node -e 'import("./src/config.js").then((m) => { const c = m.loadConfig(); console.log("dbPoolMax=" + c.dbPoolMax, "dbPoolWaitMs=" + c.dbPoolWaitMs); })'   # так: dbPoolMax=20
 ```
@@ -575,30 +586,35 @@ docker compose exec -T api node -e 'import("./src/config.js").then((m) => { cons
 `"error":"db pool wait timeout after 2000ms"` (`app/src/db.js:6`, `app/src/server.js:65`).
 Будь-яка інша неперехоплена помилка дає `500 {"error":"internal error"}`.
 
-**Як деплоїться** (`pipeline/deploy.yml`, `deploy/compose.yaml:1-8`). Образ збирає CI і пушить у
-GHCR; на VM нічого не збирається, git-checkout там немає. На VM потрібен Docker Compose
-**≥ 2.24** (`docker compose version`): старіший не розбирає `env_file:` у `compose.yaml`
-(`services.api.env_file.0 must be a string`), тож пайплайн перевіряє версію до будь-яких змін.
-Усе лежить у каталозі `/opt/poshtomat`, файли належать користувачу деплою:
+**Як деплоїться** (`pipeline/deploy.yml`, `deploy/compose.yaml:1-9`). Образ збирає CI і пушить у
+GHCR; на VM нічого не збирається, git-checkout там немає. Перш ніж щось змінити, пайплайн
+розбирає новий `compose.yaml` тим Compose, що стоїть на VM (`docker compose config --quiet`):
+файл, якого цей Compose не розуміє, не потрапить на диск (так 27.10 Compose 2.2.3 не прочитав
+давню форму `env_file:`, `docs/task-e-bonus.md`). Усе лежить у каталозі `/opt/poshtomat`, файли
+належать користувачу деплою:
 
 - `compose.yaml` — копія `deploy/compose.yaml` з репо на момент деплою;
-- `.env` — `POSHTOMAT_IMAGE=<образ@sha256:…>` і `POSHTOMAT_SHA=<коротке sha релізу>`, без секретів;
-- `secrets.env` (права 0600) — `DATABASE_URL` і `SMS_TOKEN`;
-- `compose.yaml.prev`, `.env.prev`, `secrets.env.prev` (`secrets.env.prev` теж 0600) — стан до
+- `.env` (права 0600) — `POSHTOMAT_IMAGE=<образ@sha256:…>`, `POSHTOMAT_SHA=<коротке sha релізу>`,
+  `DATABASE_URL` і `SMS_TOKEN`. Compose підставляє з нього `${…:?…}` у `compose.yaml`;
+- `compose.yaml.prev`, `.env.prev` (`.env.prev` теж 0600) — стан до
   останнього деплою, який **щось змінив**: образ, `compose.yaml` або секрети. Це **лише один крок назад**. Деплой
   без жодних змін `*.prev` не чіпає. Перший деплой за новою схемою `*.prev` не створює
-  (поточних файлів ще немає), тож вони з'являються з другого деплою, що щось змінив;
+  (поточних файлів ще немає), тож вони з'являються з другого деплою, що щось змінив.
+  `secrets.env` лишився від попередньої схеми: його читає лише `compose.yaml.prev` тієї схеми;
 - `deploys.log` — журнал, який пише пайплайн:
   - `<час> deploy <sha> <хто> <образ>` — реліз піднявся;
   - `<час> failed <sha> <хто> <образ>` — реліз `unhealthy`; пишеться одразу, ще до спроби автовідкату;
   - `<час> rollback <sha, на яке відкотилися, або unknown> <хто> failed <sha>` — автовідкат
     піднявся. Якщо `failed` стоїть останнім без `rollback` після нього, автовідкат не піднявся.
 
-Пайплайн сам відкочує реліз, лише якщо після `docker compose up --wait` сервіс `unhealthy`: він
-копіює `*.prev` назад, тож після автовідкату `*.prev` лишаються і дорівнюють поточним файлам.
+Пайплайн сам відкочує реліз, якщо після `docker compose up --wait` сервіс `unhealthy` або не
+пройшла перевірка пулу: `printenv DB_POOL_MAX` в `api` порожній чи не збігається з `dbPoolMax`,
+який бере код, або проба `GET /admin/parcels` з неіснуючою сесією дає не `403`. Він копіює
+`*.prev` назад, тож після автовідкату `*.prev` лишаються і дорівнюють поточним файлам.
 Healthcheck ходить у `/health` (`deploy/Dockerfile:24-25`), а той завжди відповідає 200
-(`app/src/server.js:37`). Тому інцидент класу 14.10 автовідкат **не** зловить: відкат — ручний,
-за цим runbook.
+(`app/src/server.js:37`). Тому перейменовану змінну пулу, як 14.10, автовідкат ловить (перевірено
+на Docker: реліз з `DB_POOL_SIZE` відкочено, `docs/task-e-bonus.md`), а насичення пулу під
+реальним трафіком після деплою — ні: тоді відкат ручний, за цим runbook.
 
 **Як читати логи.** Логи — це JSON lines з полями `ts`, `level`, `msg`. API пише **кожну**
 відповідь 5xx як `"msg":"request failed"` з полями `method`, `path`, `status`, `ms` і `error`.

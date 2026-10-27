@@ -122,6 +122,24 @@ test("E1: a substring of a read name does not count", () => {
   });
 });
 
+test("E1: a read that survives only in a comment does not count (rename in code, not in compose)", () => {
+  const renamed = [
+    "// was env.DB_POOL_MAX before the rename\nexport const c = (env) => Number(env.DB_POOL_SIZE) || 4;\n",
+    "/* env.DB_POOL_MAX */ export const c = (env) => Number(env.DB_POOL_SIZE) || 4;\n",
+  ];
+  for (const config of renamed) {
+    withConfig(config, (root) => {
+      const result = E1.check(ctx(root, { api: { environment: { DB_POOL_MAX: "20" } } }));
+      assert.equal(result.status, "FAIL", config);
+      assert.match(result.message, /api: DB_POOL_MAX — /);
+    });
+  }
+  // `//` inside a string is not a comment: the read after it on the same line still counts
+  withConfig('export const c = (env) => ["http://localhost", env.DB_POOL_MAX];\n', (root) => {
+    assert.equal(E1.check(ctx(root, { api: { environment: { DB_POOL_MAX: "20" } } })).status, "PASS");
+  });
+});
+
 test("E1: list-form environment and ${VAR:?…} references pass; an unknown bare NAME fails", () => {
   withConfig("export const c = (env) => [env.DB_POOL_MAX, env.SMS_TOKEN, env.LOG_LEVEL];\n", (root) => {
     const services = {

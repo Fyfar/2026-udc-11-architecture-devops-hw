@@ -256,6 +256,31 @@ function envEntries(environment) {
   return Object.entries(environment);
 }
 
+/** JS source without comments; strings are kept, so `"http://…"` is not taken for a comment. Regex literals are not recognised. */
+function stripComments(src) {
+  let out = "";
+  let quote = null;
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    if (quote) {
+      out += ch;
+      if (ch === "\\") out += src[++i] ?? "";
+      else if (ch === quote) quote = null;
+    } else if (ch === "/" && src[i + 1] === "/") {
+      while (i < src.length && src[i] !== "\n") i += 1;
+      out += "\n";
+    } else if (ch === "/" && src[i + 1] === "*") {
+      const end = src.indexOf("*/", i + 2);
+      i = end === -1 ? src.length : end + 1;
+      out += " ";
+    } else {
+      if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+      out += ch;
+    }
+  }
+  return out;
+}
+
 /** `${VAR}`, `${VAR:?msg}`, `$VAR` — a value that comes from outside the file. */
 function isComposeReference(value) {
   return /^\$\{[A-Za-z_][A-Za-z0-9_]*(:?\?[^}]*)?\}$/.test(value) || /^\$[A-Za-z_][A-Za-z0-9_]*$/.test(value);
@@ -633,8 +658,8 @@ export const RULES = [
       const configPath = "app/src/config.js";
       const full = join(root, configPath);
       if (!existsSync(full)) return fail(`${configPath} не знайдено — нема з чим звірити compose`);
-      // exact names after `env.`, not substrings
-      const read = new Set([...readFileSync(full, "utf8").matchAll(/\benv\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]));
+      // exact names after `env.`, not substrings, and not in comments
+      const read = new Set([...stripComments(readFileSync(full, "utf8")).matchAll(/\benv\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]));
       // read by Node / the OS, not by config.js
       const runtime = new Set(["TZ", "NODE_ENV", "NODE_OPTIONS"]);
       // `Number(x) || 4` in config.js silently defaults on a missing, empty or non-numeric value:

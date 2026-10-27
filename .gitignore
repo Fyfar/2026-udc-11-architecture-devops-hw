@@ -1,8 +1,6 @@
 node_modules/
 .env
 .env.*
-# deploy/compose.yaml reads secrets from ./secrets.env (DATABASE_URL, SMS_TOKEN)
-secrets.env
 out/
 *.log
 # incident/ is evidence for Task C — every file in it stays tracked, *.log included
