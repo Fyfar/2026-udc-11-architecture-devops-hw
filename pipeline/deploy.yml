@@ -212,7 +212,7 @@ jobs:
               || { echo "::error::api: DB_POOL_MAX не задано, код візьме дефолт 4"; return 1; }
             got="$(docker compose exec -T api node -e 'import("./src/config.js").then((m) => console.log(m.loadConfig().dbPoolMax))')" || return 1
             if [ "$want" != "$got" ]; then echo "::error::api: DB_POOL_MAX=$want, а код бере $got"; return 1; fi
-            # неіснуюча сесія: обробник бере з'єднання з пулу, шукає її і відповідає 403
+            # сесія, якої немає: обробник бере з'єднання з пулу, шукає її і відповідає 403
             code="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer probe-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')" http://127.0.0.1:8080/admin/parcels)" || true
             if [ "$code" != 403 ]; then echo "::error::проба пулу: $code замість 403"; return 1; fi
           }
