@@ -49,9 +49,14 @@ jobs:
       - name: Unit tests
         working-directory: app
         run: npm test
+      # Тести самого перевіряльника, зокрема E1 (tools/test/env-contract.test.mjs).
+      - name: Checker tests
+        run: npm run test:tools
       # Правила check-deploy для Dockerfile і compose, зокрема E1: env у compose звіряється
-      # з app/src/config.js (action item #1 з docs/postmortem.md). W-правила перевіряють сам
-      # workflow за шляхом pipeline/deploy.yml — тут він лежить у .github/workflows/.
+      # з app/src/config.js (action item #1 з docs/postmortem.md). W-правила виключено навмисно:
+      # вони читають workflow лише за шляхом pipeline/deploy.yml, а запущений workflow лежить у
+      # .github/workflows/deploy.yml, тож тут W1 упав би з «не знайдено». W1–W5 перевіряє
+      # `npm run check:deploy` до переносу файлу.
       - name: Check deploy config
         run: |
           node --input-type=module -e 'import { RULES, runChecks, loadContext, formatReport } from "./tools/check-deploy.mjs"; const r = runChecks(loadContext("."), RULES.filter((x) => !x.id.startsWith("W"))); process.stdout.write(formatReport(r)); if (r.some((x) => x.status === "FAIL")) process.exitCode = 1;'
@@ -241,6 +246,8 @@ jobs:
               if [ -f "$f.prev" ]; then cp -p "$f.prev" "$f"; fi
             done
             docker compose up -d --remove-orphans --wait --wait-timeout 90
+            # Та сама перевірка, що й для релізу: без неї rollback у журналі означав би лише «/health 200».
+            pool_ok || { echo "::error::відкат піднявся, але перевірка пулу не пройшла"; exit 1; }
             echo "Rolled back to $(grep '^POSHTOMAT_' .env | tr '\n' ' ')"   # без секретів з .env
             # Друге поле — sha, на який відкотилися; у .env, записаному до цієї схеми,
             # POSHTOMAT_SHA немає → unknown.

@@ -74,6 +74,12 @@
   | 4. Compose, якого Compose на VM не розбирає | `config --quiet` зупинив деплой до будь-яких змін на диску | — |
   | 5. Після A і B — знову B, але проба пулу тимчасово падає (підмінено `curl`) | Відкату немає, працює далі B (`api` healthy), exit 1. До другого рев'ю PR тут був відкат на старіший A із записом `rollback aaaaaaa` | `failed bbbbbbb … unchanged` |
   | 6. Потім C з `DB_POOL_SIZE` | Відкат на B, тобто на попередній реліз, а не на A | `failed ccccccc`, `rollback bbbbbbb … failed ccccccc` |
+  | 7. Після третього рев'ю PR (відкат теж проходить перевірку пулу): A, потім C з `DB_POOL_SIZE` | Відкат на A, перевірка пулу після відкату пройшла | `deploy aaaaaaa`, `failed ccccccc`, `rollback aaaaaaa … failed ccccccc` |
+  | 8. Потім D з `DB_POOL_SIZE`, і проба пулу падає також після відкату (підмінено `curl`) | `::error::відкат піднявся, але перевірка пулу не пройшла`, exit 1. `rollback` у журнал не записано, тож за runbook це гілка «автовідкат не піднявся або не пройшов перевірку» | `failed ddddddd` |
+
+  Чому в runbook для повтору без змін стоїть `--force-recreate`: у тій самій теці
+  `docker compose up -d --wait api worker` вивів `Container poshtomat-api-1 Running` (контейнер не
+  перестворено), а з `--force-recreate` — `Recreated`, потім `Healthy`.
 
   До рев'ю PR деплой 2 закінчувався б `Deployed`: `up --wait` з таким compose дає exit 0, а
   `/health` — 200 (`docker compose exec -T api printenv DB_POOL_MAX` → exit 1, `dbPoolMax=4`).
