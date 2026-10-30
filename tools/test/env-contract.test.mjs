@@ -140,6 +140,25 @@ test("E1: a read that survives only in a comment does not count (rename in code,
   });
 });
 
+test("E1: a name inside a string literal is not a read; ${…} in a template literal is", () => {
+  const set = { api: { environment: { DB_POOL_MAX: "20", DB_POOL_SIZE: "20" } } };
+  const quoted = [
+    'export const c = (env) => [env.DB_POOL_MAX, "env.DB_POOL_SIZE"];\n',
+    "export const c = (env) => [env.DB_POOL_MAX, 'set env.DB_POOL_SIZE \\' first'];\n",
+    "export const c = (env) => [env.DB_POOL_MAX, `env.DB_POOL_SIZE ${1}`];\n",
+  ];
+  for (const config of quoted) {
+    withConfig(config, (root) => {
+      const result = E1.check(ctx(root, set));
+      assert.equal(result.status, "FAIL", config);
+      assert.match(result.message, /api: DB_POOL_SIZE — /);
+    });
+  }
+  withConfig("export const c = (env) => `${env.DB_POOL_MAX}/${ { n: env.DB_POOL_SIZE }.n }`;\n", (root) => {
+    assert.equal(E1.check(ctx(root, set)).status, "PASS");
+  });
+});
+
 test("E1: list-form environment and ${VAR:?…} references pass; an unknown bare NAME fails", () => {
   withConfig("export const c = (env) => [env.DB_POOL_MAX, env.SMS_TOKEN, env.LOG_LEVEL];\n", (root) => {
     const services = {

@@ -256,16 +256,39 @@ function envEntries(environment) {
   return Object.entries(environment);
 }
 
-/** JS source without comments; strings are kept, so `"http://…"` is not taken for a comment. Regex literals are not recognised. */
-function stripComments(src) {
+/**
+ * JS source as code only: comments dropped, string contents blanked (`"http://…"` is not a
+ * comment, `"env.X"` is not a read), `${…}` inside a template literal kept as code.
+ * Regex literals are not recognised.
+ */
+function codeOnly(src) {
   let out = "";
   let quote = null;
+  const templates = []; // per open `${…}`: depth of `{` inside it
   for (let i = 0; i < src.length; i += 1) {
     const ch = src[i];
     if (quote) {
+      if (ch === "\\") {
+        i += 1;
+        out += " ";
+      } else if (ch === quote) {
+        quote = null;
+        out += ch;
+      } else if (quote === "`" && ch === "$" && src[i + 1] === "{") {
+        templates.push(0);
+        quote = null;
+        i += 1;
+        out += "${";
+      } else out += ch === "\n" ? ch : " ";
+    } else if (templates.length && (ch === "{" || ch === "}")) {
+      const top = templates.length - 1;
+      if (ch === "{") templates[top] += 1;
+      else if (templates[top] > 0) templates[top] -= 1;
+      else {
+        templates.pop();
+        quote = "`";
+      }
       out += ch;
-      if (ch === "\\") out += src[++i] ?? "";
-      else if (ch === quote) quote = null;
     } else if (ch === "/" && src[i + 1] === "/") {
       while (i < src.length && src[i] !== "\n") i += 1;
       out += "\n";
@@ -659,7 +682,7 @@ export const RULES = [
       const full = join(root, configPath);
       if (!existsSync(full)) return fail(`${configPath} не знайдено — нема з чим звірити compose`);
       // exact names after `env.`, not substrings, and not in comments
-      const read = new Set([...stripComments(readFileSync(full, "utf8")).matchAll(/\benv\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]));
+      const read = new Set([...codeOnly(readFileSync(full, "utf8")).matchAll(/\benv\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]));
       // read by Node / the OS, not by config.js
       const runtime = new Set(["TZ", "NODE_ENV", "NODE_OPTIONS"]);
       // `Number(x) || 4` in config.js silently defaults on a missing, empty or non-numeric value:

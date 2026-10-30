@@ -211,6 +211,8 @@ jobs:
 
           # /health не звертається до пулу (14.10 відповідав 200 увесь інцидент), тож після --wait
           # перевіряємо, що api справді отримав DB_POOL_MAX і пул видає з'єднання.
+          # Не більше: читання parcels (потрібна справжня сесія — ще один секрет) і насичення
+          # пулу під трафіком так не видно — це readiness-ендпоінт з docs/postmortem.md, дія #8.
           pool_ok() {
             local want got code
             want="$(docker compose exec -T api printenv DB_POOL_MAX)" \
